@@ -1,19 +1,30 @@
-/* Operations HQ — local-first chief-of-staff app.
+/* Operations HQ — local-first chief-of-staff app with time tracking.
    Data is stored in this browser (localStorage). No server, no tracking.
    Google Calendar is optional and connects directly from your browser. */
 
 (function () {
   "use strict";
 
-  var KEY = "ops_hq_v1";
+  var KEY = "ops_hq_v2";
   var $ = function (s, r) { return (r || document).querySelector(s); };
   var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
 
-  /* ---------- seed data (your three projects) ---------- */
   function todayLabel() {
     return new Date().toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" });
   }
   function nowISO() { return new Date().toISOString(); }
+  function dayKey(d) { d = d || new Date(); return d.toISOString().slice(0, 10); }
+
+  /* which project does a task belong to? infer from its text, else "Other" */
+  var PROJECT_HINTS = [
+    ["English Partner", /english partner|recharge|meta \+ google/i],
+    ["Avanzar Health", /avanzar/i],
+    ["Vasantha", /vasantha|ems|smt|pcb|landing page|associate|box build|turnkey/i]
+  ];
+  function projectOf(text) {
+    for (var i = 0; i < PROJECT_HINTS.length; i++) if (PROJECT_HINTS[i][1].test(text)) return PROJECT_HINTS[i][0];
+    return "Other";
+  }
 
   function seed() {
     return {
@@ -61,7 +72,7 @@
       projects: [
         { name: "English Partner", goal: "Maintain & grow ad performance for paying retainer (live income)", status: "Active / ongoing", milestone: "Unbroken daily continuity", prio: "High", risks: "Budget dries if recharge missed; performance dips if checks skipped", updated: nowISO() },
         { name: "Avanzar Health", goal: "Deliver on new client commitment (4 hrs/day typical, 1–6 range)", status: "Starts Wednesday", milestone: "Kickoff + scope lock", prio: "High", risks: "Scope undefined; variable hours squeeze other projects", updated: nowISO() },
-        { name: "Vasantha Advanced Systems", goal: "Generate offshore OEM/EMS customers via LinkedIn, email, SEO, events", status: "Not started — directing 1 full-time associate", milestone: "Phase 1 website positioning (months 1–2)", prio: "High", risks: "Associate is learning — needs bounded tasks, examples, deadlines, and review on every output", updated: nowISO() }
+        { name: "Vasantha Advanced Systems", goal: "Generate offshore OEM/EMS customers via LinkedIn, email, SEO, events", status: "Not started — directing 1 full-time associate", milestone: "Phase 1 website positioning (months 1–2)", prio: "High", risks: "Associate is learning — needs bounded tasks, examples, deadlines, review on every output", updated: nowISO() }
       ],
       recurring: [
         { name: "English Partner — daily recharge", freq: "Daily", last: "" },
@@ -71,7 +82,10 @@
         { name: "Vasantha — 3 educational LinkedIn posts", freq: "Weekly", last: "" },
         { name: "Vasantha — 2 facility showcase posts", freq: "Weekly", last: "" },
         { name: "Vasantha — 1 long-form article", freq: "Monthly", last: "" }
-      ]
+      ],
+      /* time tracking */
+      timer: { activeList: null, activeI: null, startedAt: null }, /* the one running task */
+      log: []  /* entries: { date:"YYYY-MM-DD", project:"", task:"", seconds: N } */
     };
   }
 
@@ -79,10 +93,12 @@
   function load() {
     try { var raw = localStorage.getItem(KEY); DB = raw ? JSON.parse(raw) : seed(); }
     catch (e) { DB = seed(); }
+    if (!DB.timer) DB.timer = { activeList: null, activeI: null, startedAt: null };
+    if (!DB.log) DB.log = [];
   }
   function save() {
     DB.meta.updated = nowISO();
-    try { localStorage.setItem(KEY, JSON.stringify(DB)); } catch (e) { toast("Could not save — storage full or blocked"); }
+    try { localStorage.setItem(KEY, JSON.stringify(DB)); } catch (e) { toast("Could not save — storage blocked"); }
   }
 
   function esc(s) { return (s || "").replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
@@ -95,7 +111,77 @@
     clearTimeout(toastTimer); toastTimer = setTimeout(function () { el.classList.remove("show"); }, 2200);
   }
 
-  /* ---------- daily ---------- */
+  /* ---------- time helpers ---------- */
+  function fmt(sec) {
+    sec = Math.round(sec);
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (h) return h + "h " + (m < 10 ? "0" : "") + m + "m";
+    if (m) return m + "m " + (s < 10 ? "0" : "") + s + "s";
+    return s + "s";
+  }
+  function fmtHours(sec) { return (sec / 3600).toFixed(1) + " h"; }
+  function isActive(listName, i) { return DB.timer.activeList === listName && DB.timer.activeI === i; }
+  function liveSeconds() { return DB.timer.startedAt ? (Date.now() - DB.timer.startedAt) / 1000 : 0; }
+
+  /* bank the currently running timer into the log, clear active */
+  function bankActive() {
+    if (DB.timer.activeList === null) return;
+    var sec = liveSeconds();
+    if (sec >= 1) {
+      var arr = path(DB, DB.timer.activeList);
+      var item = arr && arr[DB.timer.activeI];
+      var text = item ? item.t : "(removed task)";
+      DB.log.push({ date: dayKey(), project: projectOf(text), task: text, seconds: Math.round(sec) });
+    }
+    DB.timer = { activeList: null, activeI: null, startedAt: null };
+  }
+  function startTimer(listName, i) {
+    if (isActive(listName, i)) return;       /* already running */
+    bankActive();                            /* auto-pause whatever was running */
+    DB.timer = { activeList: listName, activeI: i, startedAt: Date.now() };
+    save(); renderAll(); toast("Timer started");
+  }
+  function pauseTimer() { bankActive(); save(); renderAll(); toast("Paused & saved"); }
+
+  /* total seconds logged today for a task text */
+  function loggedFor(text, onlyToday) {
+    var tk = dayKey();
+    return DB.log.reduce(function (sum, e) {
+      if (e.task !== text) return sum;
+      if (onlyToday && e.date !== tk) return sum;
+      return sum + e.seconds;
+    }, 0);
+  }
+
+  /* ---------- task rendering with timer controls ---------- */
+  function timerControls(listName, i, text) {
+    var active = isActive(listName, i);
+    var banked = loggedFor(text, true);
+    var live = active ? liveSeconds() : 0;
+    var total = banked + live;
+    var readout = total >= 1 ? '<span class="time' + (active ? " run" : "") + '">' + fmt(total) + '</span>' : "";
+    var btn = active
+      ? '<button class="tbtn pause" data-act="pause" aria-label="Pause">❚❚</button>'
+      : '<button class="tbtn play" data-act="play" data-list="' + listName + '" data-i="' + i + '" aria-label="Start">▶</button>';
+    return '<span class="ctl">' + readout + btn + '</span>';
+  }
+  function ownerTag(o) {
+    if (o === "you") return '<span class="owner you">You</span>';
+    if (o === "assoc") return '<span class="owner assoc">Assoc</span>';
+    return "";
+  }
+  function taskRows(arr, listName, withTimer) {
+    if (!arr.length) return '<div class="empty">Nothing here yet.</div>';
+    return arr.map(function (it, i) {
+      return '<div class="row">' +
+        '<button class="box ' + (it.d ? "on" : "") + '" data-act="toggle" data-list="' + listName + '" data-i="' + i + '" aria-label="Toggle">' + (it.d ? "✓" : "") + '</button>' +
+        '<div class="txt ' + (it.d ? "on" : "") + '">' + esc(it.t) + ownerTag(it.o) + '</div>' +
+        (withTimer ? timerControls(listName, i, it.t) : "") +
+        '<button class="rm" data-act="del" data-list="' + listName + '" data-i="' + i + '" aria-label="Remove">×</button>' +
+        '</div>';
+    }).join("");
+  }
+
   var DAILY_SECTIONS = [
     ["crit", "critical", "Top 3 critical outcomes"],
     ["", "deep", "Deep work"],
@@ -104,37 +190,21 @@
     ["mon", "mon", "Monitoring"],
     ["", "strat", "Strategic"]
   ];
-  function ownerTag(o) {
-    if (o === "you") return '<span class="owner you">You</span>';
-    if (o === "assoc") return '<span class="owner assoc">Assoc</span>';
-    return "";
-  }
-  function taskRows(arr, listName) {
-    if (!arr.length) return '<div class="empty">Nothing here yet.</div>';
-    return arr.map(function (it, i) {
-      return '<div class="row">' +
-        '<button class="box ' + (it.d ? "on" : "") + '" data-act="toggle" data-list="' + listName + '" data-i="' + i + '" aria-label="Toggle">' + (it.d ? "✓" : "") + '</button>' +
-        '<div class="txt ' + (it.d ? "on" : "") + '">' + esc(it.t) + ownerTag(it.o) + '</div>' +
-        '<button class="rm" data-act="del" data-list="' + listName + '" data-i="' + i + '" aria-label="Remove">×</button>' +
-        '</div>';
-    }).join("");
-  }
   function renderDaily() {
     var html = '<p class="daystamp">' + todayLabel() + '</p>';
     DAILY_SECTIONS.forEach(function (s) {
       var cls = s[0] ? " " + s[0] : "", key = "daily." + s[1];
       html += '<div class="block' + cls + '"><h2>' + s[2] + '</h2>' +
-        taskRows(DB.daily[s[1]], key) +
+        taskRows(DB.daily[s[1]], key, true) +
         '<div class="add"><input placeholder="Add…" data-addinput="' + key + '"><button data-addbtn="' + key + '">Add</button></div></div>';
     });
     $("#daily").innerHTML = html;
   }
 
-  /* ---------- sprint ---------- */
   function sprintCol(title, key) {
     var arr = DB.sprint[key], open = arr.filter(function (x) { return !x.d; }).length;
     return '<div class="block"><h2>' + title + ' <span class="count">(' + open + ')</span></h2>' +
-      taskRows(arr, "sprint." + key) +
+      taskRows(arr, "sprint." + key, true) +
       '<div class="add"><input placeholder="Add…" data-addinput="sprint.' + key + '"><button data-addbtn="sprint.' + key + '">Add</button></div></div>';
   }
   function renderSprint() {
@@ -144,7 +214,6 @@
       sprintCol("Backlog", "backlog") + '</div>';
   }
 
-  /* ---------- projects ---------- */
   function renderProjects() {
     var html = '<div class="note">A project untouched for <b>4+ days</b> gets flagged below, so nothing quietly stalls.</div>';
     DB.projects.forEach(function (p, i) {
@@ -173,7 +242,6 @@
     $("#projects").innerHTML = html;
   }
 
-  /* ---------- recurring ---------- */
   function renderRecurring() {
     var html = "";
     DB.recurring.forEach(function (r, i) {
@@ -192,30 +260,62 @@
     $("#recurring").innerHTML = html;
   }
 
-  /* ---------- calendar (Google, optional) ---------- */
+  /* ---------- TIME tab ---------- */
+  var PROJ_COLOR = { "English Partner": "#6f9bb8", "Avanzar Health": "#cf6b54", "Vasantha": "#d8853f", "Other": "#7ba05b" };
+  function sumBy(filterFn) {
+    var out = {};
+    DB.log.forEach(function (e) { if (filterFn(e)) out[e.project] = (out[e.project] || 0) + e.seconds; });
+    return out;
+  }
+  function weekAgoKey() { var d = new Date(); d.setDate(d.getDate() - 6); return dayKey(d); }
+  function barChart(map) {
+    var keys = Object.keys(map);
+    if (!keys.length) return '<div class="empty">No time logged yet. Hit ▶ on any task to start.</div>';
+    var max = Math.max.apply(null, keys.map(function (k) { return map[k]; }));
+    return '<div class="chart">' + keys.sort(function (a, b) { return map[b] - map[a]; }).map(function (k) {
+      var pct = Math.round(map[k] / max * 100);
+      return '<div class="bar-row"><div class="bar-label">' + esc(k) + '</div>' +
+        '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%;background:' + (PROJ_COLOR[k] || "#888") + ';"></div></div>' +
+        '<div class="bar-val">' + fmtHours(map[k]) + '</div></div>';
+    }).join("") + '</div>';
+  }
+  function renderTime() {
+    var live = isActive(DB.timer.activeList, DB.timer.activeI);
+    var running = "";
+    if (DB.timer.activeList !== null) {
+      var arr = path(DB, DB.timer.activeList), it = arr && arr[DB.timer.activeI];
+      if (it) running = '<div class="running"><span class="pulse"></span> Running: <b>' + esc(it.t) + '</b> · <span id="liveClock">' + fmt(liveSeconds()) + '</span>' +
+        ' <button class="btn" data-act="pause" style="margin-left:8px;">Pause</button></div>';
+    }
+    var today = sumBy(function (e) { return e.date === dayKey(); });
+    var week = sumBy(function (e) { return e.date >= weekAgoKey(); });
+    var todayTotal = Object.keys(today).reduce(function (s, k) { return s + today[k]; }, 0);
+    var weekTotal = Object.keys(week).reduce(function (s, k) { return s + week[k]; }, 0);
+
+    $("#time").innerHTML =
+      running +
+      '<div class="block"><h2>Today · ' + fmtHours(todayTotal) + ' total</h2>' + barChart(today) + '</div>' +
+      '<div class="block"><h2>Last 7 days · ' + fmtHours(weekTotal) + ' total</h2>' + barChart(week) + '</div>' +
+      '<div class="note">Time is tracked per task and rolled up to its project. Checking a task off banks its time. Only one timer runs at a time, so your hours never double-count.' +
+      ' <button class="btn" id="clearLog" style="margin-top:8px;">Clear all time logs</button></div>';
+  }
+
+  /* ---------- calendar (unchanged) ---------- */
   function renderCalendar() {
     var hasId = !!(window.OPS_CONFIG && window.OPS_CONFIG.GOOGLE_CLIENT_ID);
     var html = '<div class="cal-card"><h3>Google Calendar</h3>';
     if (!hasId) {
-      html += '<div class="cal-status">Not configured yet. Open <b>SETUP.md</b> and follow “Google Calendar” to create a free Client ID, paste it into <b>index.html</b>, then redeploy. Until then everything else works normally.</div>';
+      html += '<div class="cal-status">Not configured yet. Open <b>SETUP.md</b> and follow "Google Calendar" to create a free Client ID, paste it into <b>index.html</b>, then redeploy. Until then everything else works normally.</div>';
     } else if (!GCAL.ready) {
-      html += '<div class="cal-status">Ready to connect.</div>' +
-        '<button class="btn primary" id="gcalConnect">Connect Google Calendar</button>';
+      html += '<div class="cal-status">Ready to connect.</div><button class="btn primary" id="gcalConnect">Connect Google Calendar</button>';
     } else {
-      html += '<div class="cal-status">Connected. Pick what to push as calendar events with email + popup reminders.</div>' +
-        '<ul class="cal-list">' +
-        '<li>Daily ad work — 9:00 AM, repeats daily</li>' +
-        '<li>Evening review — 6:00 PM, repeats daily</li>' +
-        '<li>Weekly review — Friday 5:00 PM</li>' +
-        '</ul>' +
+      html += '<div class="cal-status">Connected. Push your routines as recurring events with email + popup reminders.</div>' +
+        '<ul class="cal-list"><li>Daily ad work — 9:00 AM</li><li>Evening review — 6:00 PM</li><li>Weekly review — Friday 5:00 PM</li></ul>' +
         '<button class="btn primary" id="gcalPush">Add these to my calendar</button>';
     }
-    html += '</div>';
-    html += '<div class="note">Reminders fire from Google Calendar itself (email to your inbox + popup on your laptop), which is why this app does not need to run in the background.</div>';
+    html += '</div><div class="note">Reminders fire from Google Calendar itself (email + popup), so this app needs no background process.</div>';
     $("#calendar").innerHTML = html;
   }
-
-  /* Minimal Google Identity + Calendar wrapper. Loads scripts only when used. */
   var GCAL = {
     ready: false, token: null, tokenClient: null,
     init: function (cb) {
@@ -223,11 +323,8 @@
       if (!id) { cb && cb(false); return; }
       loadScript("https://accounts.google.com/gsi/client", function () {
         GCAL.tokenClient = google.accounts.oauth2.initTokenClient({
-          client_id: id,
-          scope: "https://www.googleapis.com/auth/calendar.events",
-          callback: function (resp) {
-            if (resp && resp.access_token) { GCAL.token = resp.access_token; GCAL.ready = true; renderCalendar(); toast("Calendar connected"); }
-          }
+          client_id: id, scope: "https://www.googleapis.com/auth/calendar.events",
+          callback: function (resp) { if (resp && resp.access_token) { GCAL.token = resp.access_token; GCAL.ready = true; renderCalendar(); toast("Calendar connected"); } }
         });
         cb && cb(true);
       });
@@ -235,9 +332,7 @@
     connect: function () { if (GCAL.tokenClient) GCAL.tokenClient.requestAccessToken(); },
     addEvent: function (ev) {
       return fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
-        method: "POST",
-        headers: { Authorization: "Bearer " + GCAL.token, "Content-Type": "application/json" },
-        body: JSON.stringify(ev)
+        method: "POST", headers: { Authorization: "Bearer " + GCAL.token, "Content-Type": "application/json" }, body: JSON.stringify(ev)
       }).then(function (r) { return r.json(); });
     }
   };
@@ -245,43 +340,43 @@
     if (document.querySelector('script[src="' + src + '"]')) { cb(); return; }
     var s = document.createElement("script"); s.src = src; s.onload = cb; document.head.appendChild(s);
   }
-  function rfcAt(hour, min) {
-    var d = new Date(); d.setHours(hour, min || 0, 0, 0);
-    if (d < new Date()) d.setDate(d.getDate() + 1);
-    return d.toISOString();
-  }
+  function rfcAt(h, m) { var d = new Date(); d.setHours(h, m || 0, 0, 0); if (d < new Date()) d.setDate(d.getDate() + 1); return d.toISOString(); }
   function pushDefaults() {
-    var s = rfcAt(9, 0), e = rfcAt(9, 30);
     var events = [
-      { summary: "English Partner — recharge + ad check", start: { dateTime: s }, end: { dateTime: e }, recurrence: ["RRULE:FREQ=DAILY"], reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 0 }, { method: "email", minutes: 30 }] } },
+      { summary: "English Partner — recharge + ad check", start: { dateTime: rfcAt(9, 0) }, end: { dateTime: rfcAt(9, 30) }, recurrence: ["RRULE:FREQ=DAILY"], reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 0 }, { method: "email", minutes: 30 }] } },
       { summary: "Evening review — log what got done", start: { dateTime: rfcAt(18, 0) }, end: { dateTime: rfcAt(18, 20) }, recurrence: ["RRULE:FREQ=DAILY"], reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 0 }] } },
       { summary: "Weekly review", start: { dateTime: rfcAt(17, 0) }, end: { dateTime: rfcAt(17, 45) }, recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=FR"], reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 10 }, { method: "email", minutes: 60 }] } }
     ];
     toast("Adding events…");
-    Promise.all(events.map(GCAL.addEvent)).then(function () { toast("Added to your calendar"); })
-      .catch(function () { toast("Something went wrong — try reconnecting"); });
+    Promise.all(events.map(GCAL.addEvent)).then(function () { toast("Added to your calendar"); }).catch(function () { toast("Something went wrong — reconnect"); });
   }
 
-  /* ---------- export / import ---------- */
   function exportData() {
     var blob = new Blob([JSON.stringify(DB, null, 2)], { type: "application/json" });
     var url = URL.createObjectURL(blob), a = document.createElement("a");
-    a.href = url; a.download = "ops-hq-backup-" + new Date().toISOString().slice(0, 10) + ".json";
-    a.click(); URL.revokeObjectURL(url); toast("Backup downloaded");
+    a.href = url; a.download = "ops-hq-backup-" + dayKey() + ".json"; a.click(); URL.revokeObjectURL(url); toast("Backup downloaded");
   }
   function importData(file) {
     var rd = new FileReader();
-    rd.onload = function () { try { DB = JSON.parse(rd.result); save(); renderAll(); toast("Backup restored"); } catch (e) { toast("That file could not be read"); } };
+    rd.onload = function () { try { DB = JSON.parse(rd.result); if (!DB.timer) DB.timer = { activeList: null, activeI: null, startedAt: null }; if (!DB.log) DB.log = []; save(); renderAll(); toast("Backup restored"); } catch (e) { toast("That file could not be read"); } };
     rd.readAsText(file);
   }
 
-  /* ---------- event handling ---------- */
-  function path(obj, p) { var k = p.split("."); return obj[k[0]][k[1]]; }
+  function path(obj, p) { if (!p) return null; var k = p.split("."); return obj[k[0]] ? obj[k[0]][k[1]] : null; }
+
   document.addEventListener("click", function (e) {
-    var t = e.target;
-    var act = t.getAttribute && t.getAttribute("data-act");
-    if (act === "toggle") { var a = path(DB, t.dataset.list); a[+t.dataset.i].d = !a[+t.dataset.i].d; save(); renderAll(); return; }
-    if (act === "del") { path(DB, t.dataset.list).splice(+t.dataset.i, 1); save(); renderAll(); return; }
+    var t = e.target, act = t.getAttribute && t.getAttribute("data-act");
+    if (act === "play") { startTimer(t.dataset.list, +t.dataset.i); return; }
+    if (act === "pause") { pauseTimer(); return; }
+    if (act === "toggle") {
+      var a = path(DB, t.dataset.list), i = +t.dataset.i;
+      if (isActive(t.dataset.list, i)) bankActive();   /* finishing a running task banks its time */
+      a[i].d = !a[i].d; save(); renderAll(); return;
+    }
+    if (act === "del") {
+      if (isActive(t.dataset.list, +t.dataset.i)) bankActive();
+      path(DB, t.dataset.list).splice(+t.dataset.i, 1); save(); renderAll(); return;
+    }
     if (act === "delproj") { DB.projects.splice(+t.dataset.i, 1); save(); renderProjects(); return; }
     if (act === "recdone") { DB.recurring[+t.dataset.i].last = nowISO(); save(); renderRecurring(); toast("Marked done"); return; }
     if (act === "recdel") { DB.recurring.splice(+t.dataset.i, 1); save(); renderRecurring(); return; }
@@ -297,19 +392,17 @@
     if (t.id === "nr_add") { var rn = $("#nr_name").value.trim(); if (!rn) return; DB.recurring.push({ name: rn, freq: $("#nr_freq").value, last: "" }); save(); renderRecurring(); return; }
     if (t.id === "exportBtn") { exportData(); return; }
     if (t.id === "importBtn") { $("#importFile").click(); return; }
+    if (t.id === "clearLog") { if (confirm("Clear all logged time? This cannot be undone.")) { bankActive(); DB.log = []; save(); renderTime(); toast("Time logs cleared"); } return; }
     if (t.id === "gcalConnect") { GCAL.connect(); return; }
     if (t.id === "gcalPush") { pushDefaults(); return; }
   });
-  document.addEventListener("change", function (e) {
-    if (e.target.id === "importFile" && e.target.files[0]) importData(e.target.files[0]);
-  });
+  document.addEventListener("change", function (e) { if (e.target.id === "importFile" && e.target.files[0]) importData(e.target.files[0]); });
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Enter") return;
     var inp = e.target, key = inp.getAttribute && inp.getAttribute("data-addinput");
     if (key && inp.value.trim()) { path(DB, key).push({ t: inp.value.trim(), d: false }); inp.value = ""; save(); renderAll(); }
   });
 
-  /* ---------- tabs ---------- */
   $$(".tab").forEach(function (tab) {
     tab.addEventListener("click", function () {
       $$(".tab").forEach(function (x) { x.setAttribute("aria-selected", "false"); });
@@ -319,13 +412,19 @@
     });
   });
 
-  function renderAll() { renderDaily(); renderSprint(); renderProjects(); renderRecurring(); renderCalendar(); }
+  function renderAll() { renderDaily(); renderSprint(); renderProjects(); renderRecurring(); renderTime(); renderCalendar(); }
 
-  /* ---------- boot ---------- */
+  /* live clock tick — updates running readouts every second without full re-render */
+  setInterval(function () {
+    if (DB.timer.activeList === null) return;
+    var live = $(".time.run"); if (live) live.textContent = fmt(loggedFor((path(DB, DB.timer.activeList) || [])[DB.timer.activeI] ? path(DB, DB.timer.activeList)[DB.timer.activeI].t : "", true) + liveSeconds());
+    var lc = $("#liveClock"); if (lc) lc.textContent = fmt(liveSeconds());
+  }, 1000);
+
+  /* save running timer if user closes tab */
+  window.addEventListener("beforeunload", function () { bankActive(); save(); });
+
   load(); renderAll();
-  if (window.OPS_CONFIG && window.OPS_CONFIG.GOOGLE_CLIENT_ID) {
-    $("#dot").classList.remove("off"); $("#syncTxt").textContent = "Calendar available";
-    GCAL.init();
-  }
+  if (window.OPS_CONFIG && window.OPS_CONFIG.GOOGLE_CLIENT_ID) { $("#dot").classList.remove("off"); $("#syncTxt").textContent = "Calendar available"; GCAL.init(); }
   if ("serviceWorker" in navigator) { navigator.serviceWorker.register("sw.js").catch(function () {}); }
 })();
