@@ -273,8 +273,10 @@
       '<button class="btn primary" id="np_add" style="width:100%;">Add project</button></div>';
     html += '<div style="display:flex;gap:8px;margin-top:14px;">' +
       '<button class="btn" id="exportBtn" style="flex:1;">Export backup</button>' +
-      '<button class="btn" id="importBtn" style="flex:1;">Import backup</button>' +
-      '<button class="btn" id="aiExportBtn" style="flex:1;">AI review export</button></div>' +
+      '<button class="btn" id="importBtn" style="flex:1;">Import backup</button></div>' +
+      '<div style="display:flex;gap:8px;margin-top:8px;">' +
+      '<button class="btn primary" id="aiDailyBtn" style="flex:1;">AI daily plan</button>' +
+      '<button class="btn" id="aiWeeklyBtn" style="flex:1;">AI weekly review</button></div>' +
       '<input type="file" id="importFile" accept="application/json" style="display:none;">';
     $("#projects").innerHTML = html;
   }
@@ -455,60 +457,117 @@
     a.href = url; a.download = "ops-hq-backup-" + dayKey() + ".json"; a.click(); URL.revokeObjectURL(url); toast("Backup downloaded");
   }
   /* Build an AI-friendly text report to paste into ChatGPT / Claude for review + planning */
-  function aiReviewText() {
+  function aiReviewText(mode) {
+    mode = mode || "daily";
     var L = [];
-    L.push("OPERATIONS HQ — STATUS REPORT");
-    L.push("Generated: " + new Date().toLocaleString());
+    var today = dayKey();
+    // ---- role priming so the Chief of Staff GPT knows how to respond ----
+    L.push("ROLE: You are my Chief of Staff. I run a solo digital-marketing practice with three live projects and one full-time associate (plus a part-time web developer). Below is a structured snapshot exported from my operations tracker. Read it, then respond in the MODE specified at the end. Be specific and decisive; protect important-but-not-urgent work; flag anything being neglected. Keep recommendations to concrete next actions I can act on today.");
     L.push("");
+    L.push("SNAPSHOT GENERATED: " + new Date().toLocaleString());
+    L.push("");
+
+    // ---- SIGNAL FIRST: what needs attention, surfaced up top ----
+    L.push("=== ATTENTION FLAGS ===");
+    var flags = [];
+    DB.projects.forEach(function (p) {
+      var s = daysSince(p.updated);
+      if (s !== null && s >= 4) flags.push("NEGLECTED: " + p.name + " — no update in " + s + " days (priority " + (p.prio || "—") + ")");
+    });
+    DB.recurring.forEach(function (r) {
+      var since = daysSince(r.last), due = (since === null) || (since >= freqDays(r.freq));
+      if (due) flags.push("RECURRING DUE: " + r.name + " [" + r.freq + "]" + (since === null ? " — never logged" : " — last done " + since + "d ago"));
+    });
+    if (!flags.length) flags.push("(none — nothing overdue or neglected right now)");
+    flags.forEach(function (f) { L.push("   ! " + f); });
+    L.push("");
+
+    // ---- PROJECTS ----
     L.push("=== PROJECTS ===");
     DB.projects.forEach(function (p) {
       var stale = daysSince(p.updated);
-      L.push("• " + p.name + "  [priority: " + (p.prio || "—") + (stale !== null ? ", last updated " + stale + "d ago" : "") + "]");
-      if (p.goal) L.push("   Goal: " + p.goal);
-      if (p.status) L.push("   Status: " + p.status);
-      if (p.milestone) L.push("   Next milestone: " + p.milestone);
-      if (p.risks) L.push("   Risks: " + p.risks);
+      L.push("• " + p.name + "  [priority: " + (p.prio || "—") + (stale !== null ? ", updated " + stale + "d ago" : "") + "]");
+      if (p.goal) L.push("    goal: " + p.goal);
+      if (p.status) L.push("    status: " + p.status);
+      if (p.milestone) L.push("    next milestone: " + p.milestone);
+      if (p.risks) L.push("    risks: " + p.risks);
     });
     L.push("");
-    L.push("=== SPRINT (current) ===");
-    DB.sprint.current.forEach(function (it) { L.push("   [" + (it.d ? "x" : " ") + "] " + it.t + (it.o ? " (" + it.o + ")" : "") + (it.p ? " — " + it.p : "")); });
+
+    // ---- WORK IN FLIGHT (sprint current, with owner) ----
+    L.push("=== WORK IN FLIGHT (current sprint) ===");
+    DB.sprint.current.forEach(function (it) {
+      L.push("   [" + (it.d ? "done" : "open") + "] " + it.t + (it.o ? "  owner:" + it.o : "") + (it.p ? "  proj:" + it.p : ""));
+    });
     L.push("");
+
+    // ---- DELEGATED (anything owned by assoc, across sprint buckets) ----
+    var delegated = [];
+    ["current", "upcoming", "backlog"].forEach(function (b) {
+      DB.sprint[b].forEach(function (it) { if (it.o === "assoc" && !it.d) delegated.push("   - " + it.t + (it.p ? "  (" + it.p + ")" : "") + "  [" + b + "]"); });
+    });
+    L.push("=== DELEGATED TO ASSOCIATE (open) ===");
+    L.push(delegated.length ? delegated.join("\n") : "   (none tracked)");
+    L.push("");
+
+    // ---- TODAY'S PLAN with completion ratio ----
     L.push("=== TODAY'S PLAN ===");
     [["Critical", "critical"], ["Deep work", "deep"], ["Quick wins", "quick"], ["Follow-ups", "follow"], ["Monitoring", "mon"], ["Strategic", "strat"]].forEach(function (s) {
       var arr = DB.daily[s[1]]; if (!arr.length) return;
-      L.push(s[0] + ":");
-      arr.forEach(function (it) { L.push("   [" + (it.d ? "x" : " ") + "] " + it.t + (it.p ? " — " + it.p : "")); });
+      var done = arr.filter(function (x) { return x.d; }).length;
+      L.push(s[0] + " (" + done + "/" + arr.length + " done):");
+      arr.forEach(function (it) { L.push("   [" + (it.d ? "x" : " ") + "] " + it.t + (it.p ? "  — " + it.p : "")); });
     });
     L.push("");
-    L.push("=== RECURRING (due status) ===");
-    DB.recurring.forEach(function (r) {
-      var since = daysSince(r.last), due = (since === null) || (since >= freqDays(r.freq));
-      L.push("   " + r.name + " [" + r.freq + "] — " + (due ? "DUE NOW" : "done " + since + "d ago"));
-    });
+
+    // ---- TIME ----
+    L.push("=== TIME: TODAY (per project) ===");
+    var td = sumBy(function (e) { return e.date === today; });
+    var tdKeys = Object.keys(td).sort(function (a, b) { return td[b] - td[a]; });
+    L.push(tdKeys.length ? tdKeys.map(function (k) { return "   " + k + ": " + fmtHours(td[k]); }).join("\n") : "   (nothing logged today yet)");
     L.push("");
-    L.push("=== TIME — LAST 7 DAYS (per project) ===");
+    L.push("=== TIME: LAST 7 DAYS (per project) ===");
     var wk = sumBy(function (e) { return e.date >= weekAgoKey(); });
-    Object.keys(wk).sort(function (a, b) { return wk[b] - wk[a]; }).forEach(function (k) { L.push("   " + k + ": " + fmtHours(wk[k])); });
+    var wkKeys = Object.keys(wk).sort(function (a, b) { return wk[b] - wk[a]; });
+    L.push(wkKeys.length ? wkKeys.map(function (k) { return "   " + k + ": " + fmtHours(wk[k]); }).join("\n") : "   (no time logged in last 7 days)");
     L.push("");
-    L.push("=== REPEATING PATTERNS ===");
+
+    // ---- PATTERNS ----
+    L.push("=== REPEATING PATTERNS (from logged history) ===");
     var pats = detectPatterns();
     if (!pats.length) L.push("   (not enough history yet)");
     pats.forEach(function (r) { L.push("   " + r.task + " — " + r.cadence + " (" + r.count + " days, " + fmtHours(r.seconds) + ")"); });
     L.push("");
-    L.push("=== ASK ===");
-    L.push("Based on the above, what should I prioritise, what's at risk of being neglected, and what's my best plan for the next few days?");
+
+    // ---- MODE-SPECIFIC INSTRUCTION ----
+    L.push("=== MODE: " + (mode === "weekly" ? "WEEKLY REVIEW" : "DAILY PLANNING") + " ===");
+    if (mode === "weekly") {
+      L.push("Produce a weekly review with these sections:");
+      L.push("1. What got done vs what slipped (use the plan + time data).");
+      L.push("2. Time allocation read — did my hours match my stated priorities? Any project over/under-served?");
+      L.push("3. Projects at risk or neglected, and why.");
+      L.push("4. Associate: is delegated work moving? What's stuck?");
+      L.push("5. The 3-5 highest-impact actions for next week, in order.");
+    } else {
+      L.push("Produce today's plan:");
+      L.push("1. My Top 3 critical outcomes for today (tie each to a project goal).");
+      L.push("2. What to deliberately protect or push given the attention flags above.");
+      L.push("3. What to delegate or follow up with my associate today.");
+      L.push("4. A suggested order/time-block for the day given my flexible hours.");
+      L.push("Keep it tight and actionable.");
+    }
     return L.join("\n");
   }
-  function aiExport() {
-    var text = aiReviewText();
+  function aiExport(mode) {
+    var text = aiReviewText(mode);
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(function () { toast("AI report copied — paste into ChatGPT/Claude"); }).catch(function () { aiExportFallback(text); });
-    } else { aiExportFallback(text); }
+      navigator.clipboard.writeText(text).then(function () { toast((mode === "weekly" ? "Weekly" : "Daily") + " report copied — paste into your GPT"); }).catch(function () { aiExportFallback(text, mode); });
+    } else { aiExportFallback(text, mode); }
   }
-  function aiExportFallback(text) {
+  function aiExportFallback(text, mode) {
     var blob = new Blob([text], { type: "text/plain" });
     var url = URL.createObjectURL(blob), a = document.createElement("a");
-    a.href = url; a.download = "ai-review-" + dayKey() + ".txt"; a.click(); URL.revokeObjectURL(url); toast("AI report downloaded");
+    a.href = url; a.download = "ai-" + (mode === "weekly" ? "weekly" : "daily") + "-" + dayKey() + ".txt"; a.click(); URL.revokeObjectURL(url); toast("AI report downloaded");
   }
   function importData(file) {
     var rd = new FileReader();
@@ -558,7 +617,8 @@
     }
     if (t.id === "nr_add") { var rn = $("#nr_name").value.trim(); if (!rn) return; DB.recurring.push({ name: rn, freq: $("#nr_freq").value, last: "" }); save(); renderRecurring(); return; }
     if (t.id === "exportBtn") { exportData(); return; }
-    if (t.id === "aiExportBtn") { aiExport(); return; }
+    if (t.id === "aiDailyBtn") { aiExport("daily"); return; }
+    if (t.id === "aiWeeklyBtn") { aiExport("weekly"); return; }
     if (t.id === "importBtn") { $("#importFile").click(); return; }
     if (t.id === "clearLog") { if (confirm("Clear all logged time? This cannot be undone.")) { bankActive(); DB.log = []; save(); renderTime(); toast("Time logs cleared"); } return; }
     if (t.id === "gcalConnect") { GCAL.connect(); return; }
